@@ -11,7 +11,7 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
-from streamlit_autorefresh import st_autorefresh
+import streamlit as st
 
 # ---------- Config ----------
 st.set_page_config(page_title="Fear & Greed + FRED (Live)", page_icon="📈", layout="wide")
@@ -26,7 +26,13 @@ REFRESH_SECONDS = 60
 EXTREME_FEAR, EXTREME_GREED = 25, 75
 
 # ---------- Auto-refresh ----------
-st_autorefresh(interval=REFRESH_SECONDS * 1000, key="fg_autorefresh")
+def enable_autorefresh(seconds: int):
+    st.components.v1.html(
+        f"<script>setTimeout(function(){{window.location.reload()}}, {seconds*1000});</script>",
+        height=0
+    )
+
+enable_autorefresh(REFRESH_SECONDS)
 
 # ---------- Retry générique ----------
 def retry(n=3, base_wait=1.5):
