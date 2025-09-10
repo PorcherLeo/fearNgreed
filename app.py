@@ -1,40 +1,55 @@
-import time
-import math
-import json
-import io
-from datetime import datetime, timedelta, timezone
+# -*- coding: utf-8 -*-
+# Fear & Greed + Indicateurs FRED (T10Y2Y, HY OAS, USD Broad, 10Y) — sans VIX / Put-Call / ML
 
+from datetime import datetime, timezone
+import functools
+import time as _time
+import io
 import requests
+
 import pandas as pd
 import numpy as np
 import streamlit as st
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import roc_auc_score, accuracy_score
 import matplotlib.pyplot as plt
+from streamlit_autorefresh import st_autorefresh
 
 # ---------- Config ----------
-st.set_page_config(page_title="Fear & Greed + VIX + Put/Call (Live + ML)", page_icon="📈", layout="wide")
-API_LIVE = "https://api.alternative.me/fng/"  # live & recent crypto F&G
-API_HIST = "https://api.alternative.me/fng/?limit=0&format=json"  # full history
-# Daily BTC close (simple):
-BTC_HIST = "https://api.coindesk.com/v1/bpi/historical/close.json?currency=USD"
-# VIX from Stooq daily CSV (no key): ^VIX symbol
-VIX_CSV = "https://stooq.com/q/d/l/?s=%5Evix&i=d"
-# Cboe Equity Put/Call Ratio historical CSV (no key)
-PCR_EQUITY_CSV = "https://cdn.cboe.com/api/global/us_indices/daily_prices/EQUITY_PUT_CALL_RATIO_HISTORICAL.csv"
-# (Optional) Cboe Total Put/Call Ratio
-PCR_TOTAL_CSV = "https://cdn.cboe.com/api/global/us_indices/daily_prices/TOTAL_PUT_CALL_RATIO_HISTORICAL.csv"
+st.set_page_config(page_title="Fear & Greed + FRED (Live)", page_icon="📈", layout="wide")
 
-REFRESH_SECONDS = 60  # auto-refresh interval for the live panel
+API_LIVE = "https://api.alternative.me/fng/"
+API_HIST = "https://api.alternative.me/fng/?limit=0&format=json"
 
-# ---------- Helpers ----------
+# FRED CSV direct (pas de clé) : https://fred.stlouisfed.org/graph/fredgraph.csv?id=<SERIE>
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
+
+REFRESH_SECONDS = 60
+EXTREME_FEAR, EXTREME_GREED = 25, 75
+
+# ---------- Auto-refresh ----------
+st_autorefresh(interval=REFRESH_SECONDS * 1000, key="fg_autorefresh")
+
+# ---------- Retry générique ----------
+def retry(n=3, base_wait=1.5):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrap(*a, **k):
+            for i in range(n):
+                try:
+                    return fn(*a, **k)
+                except Exception:
+                    if i == n - 1:
+                        raise
+                    _time.sleep(base_wait * (i + 1))
+        return wrap
+    return deco
+
+# ---------- Helpers F&G ----------
 @st.cache_data(ttl=300)
+@retry()
 def fetch_live():
     r = requests.get(API_LIVE, timeout=15)
     r.raise_for_status()
     data = r.json()["data"][0]
-    # normalize
     return {
         "value": int(data["value"]),
         "classification": data["value_classification"],
@@ -42,6 +57,7 @@ def fetch_live():
     }
 
 @st.cache_data(ttl=3600)
+@retry()
 def fetch_history():
     r = requests.get(API_HIST, timeout=30)
     r.raise_for_status()
@@ -51,296 +67,245 @@ def fetch_history():
     df["timestamp"] = pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True)
     df = df.rename(columns={"value": "fng", "value_classification": "label"})
     df = df.sort_values("timestamp").reset_index(drop=True)
-    df["date"] = df["timestamp"].dt.date
+    df["date"] = df["timestamp"].dt.tz_convert(None).dt.normalize()
     return df
 
+# ---------- Helpers FRED ----------
 @st.cache_data(ttl=3600)
-def fetch_btc_close():
-    # daily close for the last ~2 years
-    end = datetime.utcnow().date()
-    start = end - timedelta(days=730)
-    url = f"https://api.coindesk.com/v1/bpi/historical/close.json?start={start}&end={end}&currency=USD"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    data = r.json()["bpi"]
-    df = pd.DataFrame({"date": pd.to_datetime(list(data.keys())).date, "close": list(data.values())})
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    return df.sort_values("date").reset_index(drop=True)
+@retry()
+def fetch_fred_series(series_id: str, colname: str) -> pd.DataFrame:
+    """
+    Télécharge un CSV FRED via fredgraph.csv?id=<SERIE> et renvoie un DF ['date', colname].
+    Détection robuste des noms de colonnes (DATE / Observation Date / etc.).
+    """
+    url = FRED_CSV.format(sid=series_id)
 
-@st.cache_data(ttl=3600)
-def fetch_vix():
-    # Stooq CSV columns: Date, Open, High, Low, Close, Volume
-    r = requests.get(VIX_CSV, timeout=30)
+    sess = requests.Session()
+    sess.headers.update({
+        "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"),
+        "Accept": "text/csv,application/csv;q=0.9,*/*;q=0.8",
+        "Referer": "https://fred.stlouisfed.org/",
+    })
+    r = sess.get(url, timeout=30)
     r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    # Normalize column names
-    cols = {c.lower(): c for c in df.columns}
-    # Ensure expected columns
-    df.columns = [c.lower() for c in df.columns]
-    # some stooq files use 'data' for date depending on locale; handle both
-    date_col = 'date' if 'date' in df.columns else ('data' if 'data' in df.columns else None)
-    if not date_col or 'close' not in df.columns:
-        raise ValueError("Unexpected VIX CSV schema from Stooq")
-    df[date_col] = pd.to_datetime(df[date_col]).dt.date
-    out = df.rename(columns={date_col: 'date', 'close': 'vix_close'})[['date', 'vix_close']]
-    out = out.sort_values('date').reset_index(drop=True)
+
+    # Lecture souple
+    df = pd.read_csv(io.StringIO(r.text), engine="python", sep=None)
+    # Nettoie les noms
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # ---- Trouver la colonne de date
+    def is_date_col(name: str) -> bool:
+        n = name.lower()
+        return ("date" in n) or ("observation" in n and "date" in n)
+
+    date_col = None
+    for c in df.columns:
+        if is_date_col(c):
+            date_col = c
+            break
+    if date_col is None:
+        # Fallback: première colonne
+        date_col = df.columns[0]
+
+    # ---- Trouver la colonne de valeur
+    val_col = None
+    if series_id in df.columns:
+        val_col = series_id
+    else:
+        # Si pas de colonne exactement = series_id, on prend la 2ᵉ colonne non-date
+        non_date_cols = [c for c in df.columns if c != date_col]
+        if len(non_date_cols) == 0:
+            raise ValueError(f"Aucune colonne de valeur trouvée dans FRED pour {series_id}. Colonnes={list(df.columns)}")
+        val_col = non_date_cols[0]
+
+    out = df[[date_col, val_col]].copy()
+    out.columns = ["date", colname]
+
+    # Dans FRED, les valeurs manquantes sont souvent le caractère '.'
+    # On remplace **uniquement** les cellules exactement '.' par NaN
+    out[colname] = out[colname].replace(".", np.nan)
+    out[colname] = pd.to_numeric(out[colname], errors="coerce")
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    out = out.dropna(subset=["date"]).sort_values("date")
+
+    # Il arrive que toutes les valeurs soient NaN sur les périodes récentes, on ffil pour corrélations
+    if out[colname].isna().all():
+        # On laisse vide, la suite gèrera; sinon tu peux faire un st.warning ici.
+        return out
     return out
 
-@st.cache_data(ttl=3600)
-def fetch_pcr_equity():
-    r = requests.get(PCR_EQUITY_CSV, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    # Typical columns: DATE, OPEN, HIGH, LOW, CLOSE
-    df.columns = [c.strip().lower() for c in df.columns]
-    date_col = 'date'
-    close_col = 'close'
-    if date_col not in df.columns or close_col not in df.columns:
-        # handle alt schemas
-        candidates = [c for c in df.columns if 'date' in c]
-        if candidates:
-            date_col = candidates[0]
-        candidates = [c for c in df.columns if 'close' in c or 'value' in c]
-        if candidates:
-            close_col = candidates[0]
-    df[date_col] = pd.to_datetime(df[date_col]).dt.date
-    df[close_col] = pd.to_numeric(df[close_col], errors='coerce')
-    out = df.rename(columns={date_col: 'date', close_col: 'pcr_equity'})[['date', 'pcr_equity']]
-    out = out.sort_values('date').reset_index(drop=True)
-    return out
 
-@st.cache_data(ttl=3600)
-def fetch_pcr_total():
-    r = requests.get(PCR_TOTAL_CSV, timeout=30)
-    r.raise_for_status()
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [c.strip().lower() for c in df.columns]
-    date_col = 'date'
-    close_col = 'close'
-    if date_col not in df.columns or close_col not in df.columns:
-        candidates = [c for c in df.columns if 'date' in c]
-        if candidates:
-            date_col = candidates[0]
-        candidates = [c for c in df.columns if 'close' in c or 'value' in c]
-        if candidates:
-            close_col = candidates[0]
-    df[date_col] = pd.to_datetime(df[date_col]).dt.date
-    df[close_col] = pd.to_numeric(df[close_col], errors='coerce')
-    out = df.rename(columns={date_col: 'date', close_col: 'pcr_total'})[['date', 'pcr_total']]
-    out = out.sort_values('date').reset_index(drop=True)
-    return out
+# Indicateurs alternatifs (FRED)
+def fetch_t10y2y():   # Courbe 10Y-2Y (spread)
+    return fetch_fred_series("T10Y2Y", "yc_spread")
+def fetch_hy_oas():   # High Yield OAS (%)
+    return fetch_fred_series("BAMLH0A0HYM2", "hy_oas")
+def fetch_usd_broad():  # USD Broad Index (2006=100)
+    return fetch_fred_series("DTWEXBGS", "usd")
+def fetch_dgs10():    # Taux 10 ans (%)
+    return fetch_fred_series("DGS10", "ust10")
+
+def zscore(s: pd.Series):
+    sd = s.std(ddof=0)
+    if not np.isfinite(sd) or sd == 0:
+        return pd.Series(0.0, index=s.index)
+    return (s - s.mean()) / sd
 
 # ---------- UI: Header ----------
-st.title("📈 Fear & Greed — Live + VIX + Put/Call + ML")
-st.caption("Sources: alternative.me (Crypto F&G), CoinDesk (BTC), Stooq (^VIX), Cboe (Equity/Total Put‑Call)")
+st.title("Fear & Greed — Live (avec indicateurs FRED)")
+st.caption("Sources: alternative.me (Crypto F&G) • FRED (T10Y2Y, HY OAS, USD Broad, DGS10)")
 
-# ---------- Live Panel ----------
-col1, col2, col3 = st.columns([1.2, 1, 1])
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.header("Paramètres")
+    win = st.slider("Fenêtre (jours)", 30, 365, 180, step=15)
+    smooth = st.checkbox("Lissage F&G (EMA 7j)", True)
+    # nouveaux indicateurs (remplacent VIX/Put-Call)
+    show_yc = st.checkbox("Courbe T10Y2Y (10Y–2Y)", True)
+    show_hy = st.checkbox("HY OAS (BAMLH0A0HYM2)", True)
+    show_usd = st.checkbox("USD Broad (DTWEXBGS)", True)
+    show_u10 = st.checkbox("Taux 10 ans (DGS10)", False)
+    st.markdown("---")
+    st.write(f"🔁 Auto-refresh : {REFRESH_SECONDS}s")
 
-with col1:
-    st.subheader("Live index")
-    try:
-        live = fetch_live()
-        st.metric("Fear & Greed", f"{live['value']}", help=f"{live['classification']}\nUpdated: {live['timestamp'].strftime('%Y-%m-%d %H:%M UTC')} ")
-        # simple gauge via matplotlib
-        fig, ax = plt.subplots(figsize=(5, 2.6))
-        ax.axis('off')
-        val = live['value']
-        # draw an arc 0..100
-        t = np.linspace(-np.pi, 0, 300)
-        ax.plot(np.cos(t), np.sin(t))
-        # needle
-        angle = -np.pi + (val/100)*np.pi
-        ax.plot([0, np.cos(angle)], [0, np.sin(angle)], linewidth=3)
-        ax.text(0, -0.2, f"{val}", ha='center', va='center', fontsize=18)
-        st.pyplot(fig, use_container_width=True)
-    except Exception as e:
-        st.error(f"Failed to load live index: {e}")
-
-with col2:
-    st.subheader("Last 90 days — F&G")
-    try:
-        hist = fetch_history()
-        last = hist.tail(90)
-        st.line_chart(last.set_index(pd.to_datetime(last["date"]))[["fng"]])
-    except Exception as e:
-        st.error(f"History error: {e}")
-
-with col3:
-    st.subheader("Auto‑refresh")
-    st.write(f"Refreshing every {REFRESH_SECONDS}s…")
-    st.button("Refresh now", on_click=lambda: st.cache_data.clear())
-    st.caption("Tip: use Streamlit's rerun toolbar to refresh manually.")
-
-st.divider()
-
-# ---------- Market Sentiment Add‑ons: VIX & Put/Call ----------
-colv, colp = st.columns(2)
-with colv:
-    st.subheader("VIX (volatility index)")
-    try:
-        vix = fetch_vix()
-        last90 = vix.tail(90)
-        st.line_chart(last90.set_index(pd.to_datetime(last90['date']))[["vix_close"]])
-        st.caption("Source: Stooq (^VIX)")
-    except Exception as e:
-        st.error(f"VIX error: {e}")
-
-with colp:
-    st.subheader("Put/Call Ratio (Equity & Total)")
-    try:
-        pcr_eq = fetch_pcr_equity()
-        pcr_tot = fetch_pcr_total()
-        merged_pcr = pd.merge(pcr_eq, pcr_tot, on='date', how='outer').sort_values('date')
-        last90p = merged_pcr.tail(90)
-        st.line_chart(last90p.set_index(pd.to_datetime(last90p['date']))[["pcr_equity", "pcr_total"]])
-        st.caption("Source: Cboe daily CSVs")
-    except Exception as e:
-        st.error(f"Put/Call error: {e}")
-
-st.divider()
-
-# ---------- ML: Predict next‑day BTC direction ----------
-st.header("🤖 Simple ML: predict next‑day BTC direction")
-st.write(
-    "This quick demo trains a time‑series logistic regression to predict whether BTC goes **up** tomorrow (close-to-close) using Fear & Greed, **VIX**, and **Put/Call ratios**, plus simple momentum/volatility features."
-)
-
-with st.expander("Settings", expanded=False):
-    lookback = st.slider("Lookback window (days) for rolling stats", 3, 60, 14)
-    n_splits = st.slider("TimeSeries CV splits", 3, 10, 5)
-
-@st.cache_data(ttl=3600)
-def prepare_features(lookback: int = 14):
-    fng = fetch_history()[["date", "fng"]]
-    btc = fetch_btc_close()[["date", "close"]]
-    vix = fetch_vix()[["date", "vix_close"]]
-    pcr_eq = fetch_pcr_equity()[["date", "pcr_equity"]]
-    pcr_tot = fetch_pcr_total()[["date", "pcr_total"]]
-
-    df = btc.merge(fng, on="date", how="left") \
-            .merge(vix, on="date", how="left") \
-            .merge(pcr_eq, on="date", how="left") \
-            .merge(pcr_tot, on="date", how="left")
-
-    # forward fill to align calendars (crypto trades every day, VIX/Cboe are business days)
-    df = df.sort_values('date')
-    df[['fng','vix_close','pcr_equity','pcr_total']] = df[['fng','vix_close','pcr_equity','pcr_total']].fillna(method='ffill')
-
-    # returns
-    df["ret1"] = df["close"].pct_change()
-
-    # rolling stats
-    for col, base in [("fng","fng"),("vix_close","vix"),("pcr_equity","pcrEQ"),("pcr_total","pcrTOT")]:
-        ma = f"{base}_ma"; sd = f"{base}_std"; z = f"{base}_z"
-        df[ma] = df[col].rolling(lookback).mean()
-        df[sd] = df[col].rolling(lookback).std()
-        df[z] = (df[col] - df[ma]) / (df[sd] + 1e-6)
-
-    # momentum/volatility features on BTC
-    for w in [3, 7, 14, 30]:
-        df[f"mom_{w}"] = df["close"].pct_change(w)
-        df[f"vol_{w}"] = df["ret1"].rolling(w).std()
-
-    # daily deltas on VIX/PCR
-    df['vix_chg'] = df['vix_close'].pct_change()
-    df['pcrEQ_chg'] = df['pcr_equity'].pct_change()
-    df['pcrTOT_chg'] = df['pcr_total'].pct_change()
-
-    # target: next-day up (1) or not (0)
-    df["ret1_fwd"] = df["close"].pct_change().shift(-1)
-    df["target"] = (df["ret1_fwd"] > 0).astype(int)
-
-    df = df.dropna().reset_index(drop=True)
-
-    features = [
-        # F&G
-        "fng", "fng_ma", "fng_std", "fng_z",
-        # VIX
-        "vix_close", "vix_ma", "vix_std", "vix_z", "vix_chg",
-        # Put/Call (Equity & Total)
-        "pcr_equity", "pcrEQ_ma", "pcrEQ_std", "pcrEQ_z", "pcrEQ_chg",
-        "pcr_total", "pcrTOT_ma", "pcrTOT_std", "pcrTOT_z", "pcrTOT_chg",
-        # BTC price dynamics
-        "mom_3", "mom_7", "mom_14", "mom_30",
-        "vol_3", "vol_7", "vol_14", "vol_30",
-    ]
-
-    # Some columns may not exist if lookback trims too much; ensure they exist
-    features = [f for f in features if f in df.columns]
-
-    X = df[features].values
-    y = df["target"].values
-    dates = pd.to_datetime(df["date"])
-    return X, y, dates, df, features
-
-
-def train_and_eval(lookback: int = 14, n_splits: int = 5):
-    X, y, dates, df, features = prepare_features(lookback)
-
-    tscv = TimeSeriesSplit(n_splits=n_splits)
-    proba = np.zeros_like(y, dtype=float)
-    preds = np.zeros_like(y, dtype=int)
-
-    for train_idx, test_idx in tscv.split(X):
-        model = LogisticRegression(max_iter=500)
-        model.fit(X[train_idx], y[train_idx])
-        proba[test_idx] = model.predict_proba(X[test_idx])[:, 1]
-        preds[test_idx] = (proba[test_idx] >= 0.5).astype(int)
-
-    valid = proba > 0
-    auc = roc_auc_score(y[valid], proba[valid]) if valid.any() else float('nan')
-    acc = accuracy_score(y[valid], preds[valid]) if valid.any() else float('nan')
-
-    return proba, preds, y, dates, df, features, auc, acc
-
-# Train button
-colA, colB = st.columns([1, 2])
-with colA:
-    if st.button("Train / Re‑train model"):
-        st.session_state["ml_run"] = True
-
-ran = st.session_state.get("ml_run", False)
-
-with colB:
-    if ran:
-        with st.spinner("Training model…"):
-            proba, preds, y, dates, df, features, auc, acc = train_and_eval(lookback, n_splits)
-        st.success(f"Done. CV AUC = {auc:.3f} | Accuracy = {acc:.3f}")
-
-        # Plot probability over time
-        fig2, ax2 = plt.subplots(figsize=(9, 3.2))
-        ax2.plot(dates, proba, label="P(up)")
-        ax2.plot(dates, y, linestyle=":", label="Actual up (0/1)")
-        ax2.set_title("Predicted probability of next‑day BTC going up")
-        ax2.legend()
-        st.pyplot(fig2, use_container_width=True)
-
-        # Show recent feature importances via absolute coefficients
-        model = LogisticRegression(max_iter=500)
-        X, y, dates, df, features = prepare_features(lookback)[:5]
-        model.fit(X, y)
-        coefs = pd.Series(np.abs(model.coef_[0]), index=features).sort_values(ascending=False)
-        st.subheader("Feature importance (|coefficients|)")
-        st.bar_chart(coefs)
-
-        st.caption("Note: Educational demo. Not financial advice.")
-
-st.divider()
-
-# ---------- Data Inspector ----------
-st.subheader("Data preview")
+# ---------- Charge F&G ----------
 try:
-    hist = fetch_history().tail(5)
-    vixp = fetch_vix().tail(5)
-    pcre = fetch_pcr_equity().tail(5)
-    dfprev = hist.merge(vixp, on='date', how='outer').merge(pcre, on='date', how='outer').sort_values('date').tail(10)
-    st.dataframe(dfprev, use_container_width=True)
+    hist = fetch_history()
 except Exception as e:
-    st.error(f"Data preview error: {e}")
+    st.error(f"Impossible de charger l'historique F&G : {e}")
+    st.stop()
+
+# ---------- Onglets ----------
+tab_live, tab_hist, tab_corr = st.tabs(["Live", "Historique", "Corrélations & Composite"])
+
+# ---------- Live ----------
+with tab_live:
+    col1, col2, col3 = st.columns([1.2, 1, 1])
+    with col1:
+        st.subheader("Index en direct")
+        try:
+            live = fetch_live()
+            st.metric("Fear & Greed", f"{live['value']}",
+                      help=f"{live['classification']}\nMàJ: {live['timestamp'].strftime('%Y-%m-%d %H:%M UTC')}")
+            # mini jauge
+            fig, ax = plt.subplots(figsize=(5, 2.6))
+            ax.axis("off")
+            val = live["value"]
+            t = np.linspace(-np.pi, 0, 300)
+            ax.plot(np.cos(t), np.sin(t))
+            angle = -np.pi + (val / 100) * np.pi
+            ax.plot([0, np.cos(angle)], [0, np.sin(angle)], linewidth=3)
+            ax.text(0, -0.2, f"{val}", ha="center", va="center", fontsize=18)
+            st.pyplot(fig, use_container_width=True)
+        except Exception as e:
+            st.error(f"Échec du live index : {e}")
+
+    with col2:
+        st.subheader("Derniers 90 jours — F&G")
+        try:
+            last = hist.tail(90).copy()
+            if smooth:
+                last["fng"] = last["fng"].ewm(span=7, adjust=False).mean()
+            st.line_chart(last.set_index(pd.to_datetime(last["date"]))[["fng"]])
+        except Exception as e:
+            st.error(f"Erreur d'historique : {e}")
+
+    with col3:
+        st.subheader("Actions")
+        st.download_button("⬇️ Export F&G (CSV)", data=hist.to_csv(index=False),
+                           file_name="fng_history.csv", mime="text/csv")
+        latest = int(hist.iloc[-1]["fng"])
+        if latest <= EXTREME_FEAR:
+            st.success("🟢 Zone **Extreme Fear** (contrarian bullish, hist.)")
+        elif latest >= EXTREME_GREED:
+            st.error("🔴 Zone **Extreme Greed** (risque de prise de bénéfices)")
+        try:
+            crossed = (hist["fng"].iloc[-2] > EXTREME_FEAR) and (latest <= EXTREME_FEAR)
+            if crossed:
+                st.toast("F&G vient d’entrer en Extreme Fear", icon="✅")
+        except Exception:
+            pass
+
+# ---------- Historique (z-scores, fenêtre) ----------
+with tab_hist:
+    st.subheader("Vue normalisée (z-score) — indicateurs FRED")
+    base = hist[["date", "fng"]].copy()
+
+    # Ajoute les indicateurs choisis
+    def merge_try(df, fetch_fn, name):
+        try:
+            fetched = fetch_fn()
+            # Harmonise les types de date
+            fetched["date"] = pd.to_datetime(fetched["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+            return df.merge(fetched, on="date", how="outer")
+        except Exception as e:
+            st.warning(f"{name} indisponible : {e}")
+            return df
+
+    if show_yc:  base = merge_try(base, fetch_t10y2y, "T10Y2Y")
+    if show_hy:  base = merge_try(base, fetch_hy_oas, "HY OAS")
+    if show_usd: base = merge_try(base, fetch_usd_broad, "USD Broad")
+    if show_u10: base = merge_try(base, fetch_dgs10, "DGS10")
+
+    base = base.sort_values("date").set_index("date").ffill().dropna(how="all")
+
+    # z-scores
+    z = pd.DataFrame(index=base.index)
+    for c in [c for c in ["fng", "yc_spread", "hy_oas", "usd", "ust10"] if c in base.columns]:
+        z[f"{c}_z"] = zscore(base[c])
+
+    if len(z) == 0:
+        st.info("Pas assez de données pour afficher la vue normalisée.")
+    else:
+        st.line_chart(z.iloc[-win:])
+
+# ---------- Corrélations & Composite ----------
+with tab_corr:
+    st.subheader("Corrélations roulantes (60 j) & Score composite")
+
+    # Reconstruit z (indépendant des autres onglets)
+    base2 = hist[["date", "fng"]].copy()
+    if show_yc:  base2 = merge_try(base2, fetch_t10y2y, "T10Y2Y")
+    if show_hy:  base2 = merge_try(base2, fetch_hy_oas, "HY OAS")
+    if show_usd: base2 = merge_try(base2, fetch_usd_broad, "USD Broad")
+    if show_u10: base2 = merge_try(base2, fetch_dgs10, "DGS10")
+    base2 = base2.sort_values("date").set_index("date").ffill().dropna(how="all")
+
+    z2 = pd.DataFrame(index=base2.index)
+    if "fng" in base2:      z2["fng_z"] = zscore(base2["fng"])
+    if "yc_spread" in base2: z2["yc_z"]  = zscore(base2["yc_spread"])
+    if "hy_oas" in base2:    z2["hy_z"]  = zscore(base2["hy_oas"])
+    if "usd" in base2:       z2["usd_z"] = zscore(base2["usd"])
+    if "ust10" in base2:     z2["u10_z"] = zscore(base2["ust10"])
+
+    # Corrélations roulantes 60 j
+    try:
+        for name in ["yc_z", "hy_z", "usd_z", "u10_z"]:
+            if name in z2.columns:
+                corr = z2[["fng_z", name]].rolling(60).corr().dropna()
+                st.write(f"Corrélation roulante F&G vs {name.replace('_z','').upper()} (60 j)")
+                st.line_chart(corr.xs("fng_z", level=1))
+    except Exception as e:
+        st.warning(f"Corrélations non disponibles : {e}")
+
+    # Composite (↑ = plus 'greed'):
+    # + fng, + yc_spread (courbe + pentue = risk-on), - hy_oas (spread élevé = risk-off),
+    # - usd (USD fort = risk-off), - ust10 (taux long qui s'envole = souvent risk-off)
+    parts = []
+    if "fng_z" in z2:   parts.append(z2["fng_z"])
+    if "yc_z" in z2:    parts.append(z2["yc_z"])
+    if "hy_z" in z2:    parts.append(-z2["hy_z"])
+    if "usd_z" in z2:   parts.append(-z2["usd_z"])
+    if "u10_z" in z2:   parts.append(-z2["u10_z"])
+    if parts:
+        comp = pd.concat(parts, axis=1).mean(axis=1)
+        st.metric("Composite (F&G + FRED, z)", f"{comp.iloc[-1]:.2f}")
+        st.line_chart(comp.iloc[-win:].to_frame("risk_score"))
+    else:
+        st.info("Sélectionnez au moins un indicateur FRED pour calculer le composite.")
 
 # ---------- Footer ----------
-st.caption(
-    "Built with Streamlit • F&G: alternative.me • BTC: CoinDesk • VIX: Stooq • Put/Call: Cboe. "
-    "This demo auto‑refreshes the live index every 60 seconds."
-)
+st.divider()
