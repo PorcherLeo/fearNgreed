@@ -28,10 +28,11 @@ EXTREME_FEAR, EXTREME_GREED = 25, 75
 # ---------- Auto-refresh ----------
 def enable_autorefresh(seconds: int):
     st.components.v1.html(
-        f"<script>setTimeout(function(){{window.location.reload()}}, {seconds*1000});</script>",
+        f"<script>setTimeout(function(){{window.location.reload()}}, {int(seconds*1000)});</script>",
         height=0
     )
 
+# Active l'auto-refresh
 enable_autorefresh(REFRESH_SECONDS)
 
 # ---------- Retry générique ----------
