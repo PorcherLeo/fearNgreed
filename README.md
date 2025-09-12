@@ -1,46 +1,64 @@
-# Fear & Greed + FRED (Live)
+# Fear & Greed + Markets (Streamlit)
 
-A lightweight Streamlit dashboard that combines the **Crypto Fear & Greed Index** (alternative.me) with robust **macro risk proxies from FRED** to visualize sentiment, rolling correlations, and a simple composite risk score.
+A lightweight Streamlit dashboard that shows the **Crypto Fear & Greed Index** alongside practical **market tools**: pivots, rates, earnings multiples, mega-cap tech monitors, and an assets **correlation heatmap**.
 
----
-
-## Features
-
-- **Live panel**: current Fear & Greed value + a minimal gauge.
-- **History**: last 90 days with optional 7-day EMA smoothing.
-- **FRED indicators** (toggle in the sidebar):
-  - **T10Y2Y** — 10Y–2Y Treasury slope (risk-on when steepening)
-  - **BAMLH0A0HYM2** — High-Yield OAS (risk-off when widening)
-  - **DTWEXBGS** — Broad U.S. Dollar index (risk-off when strengthening)
-  - **DGS10** — 10Y U.S. Treasury yield (often risk-off when surging)
-- **Rolling correlations** (60 days) between Fear & Greed and each selected indicator.
-- **Composite score** (z-score blend): ↑ implies more “greed” (risk-on).
-- **CSV export** of the Fear & Greed history.
-- **Auto-refresh** (default: every 60s).
+> Educational only — not investment advice.
 
 ---
 
-## Data Sources
+## What’s inside
 
-- Fear & Greed Index: `https://api.alternative.me/fng/`
-- FRED CSV: `https://fred.stlouisfed.org/graph/fredgraph.csv?id=<SERIES_ID>`
+### Page 1 — Markets (prices, monthly pivots S3, rates, meetings)
+- **Prices**: EURUSD, SPY, QQQ, ES (S&P futures), NQ (Nasdaq futures)
+- **Monthly Pivot S3** (previous full month):
+  - `P = (H + L + C) / 3`
+  - `S3 = P − 2 × (H − L)`
+  - Distance to S3 and status (above/below)
+- **Mini chart** with S3 overlay
+- **Rates (FRED)**: Fed funds (upper, `DFEDTARU`), ECB main refi (`ECBMRRFR`), US 10Y (`DGS10`), DE 10Y (`IRLTLT01DEM156N`)
+- **Next meetings**: FOMC & ECB (light HTML scrape with a manual override if needed)
 
-No API keys needed.
+### Page 2 — Fear & Greed + P/E & Beta
+- **Fear & Greed**: live score (value/100)
+- **P/E (TTM)** and **Beta vs SPY** for: SPY, QQQ, **NVDA, AMD, MSFT, AAPL, AMZN, META, NFLX**
+  - Beta computed from ~1y daily returns: `β = cov(asset, SPY) / var(SPY)`
+  - P/E from Yahoo (`trailingPE`) or fallback `price / trailingEps`
+
+### Page 3 — Mega-cap Tech cards
+- **NVDA, AMD, MSFT, AAPL, AMZN, META, NFLX, GOOGL**  
+- For each: **last price**, **d%**, **7d%**, **30d%** (robust to holidays/holes)
+
+### Page 4 — Correlations between assets
+- Custom universe (defaults include SPY/QQQ/mega-caps, EURUSD, ES, NQ, BTC)
+- Choice of **frequency** (daily/weekly/monthly), **window** (e.g., 90), and **returns** (simple/log)
+- Heatmap with per-cell Pearson correlations
 
 ---
 
-## Quick Start
+## Data sources
+
+- **Fear & Greed Index**: `https://api.alternative.me/fng/`
+- **Yahoo Finance** via `yfinance` (e.g., `EURUSD=X`, `ES=F`, `NQ=F`, `NVDA`, …)
+- **FRED** CSV (no key): `https://fred.stlouisfed.org/graph/fredgraph.csv?id=<SERIES_ID>`
+  - `DFEDTARU`, `ECBMRRFR`, `DGS10`, `IRLTLT01DEM156N`
+- **Calendars**: FOMC official site & ECB calendar (simple HTML parsing)
+
+---
+
+## Quick start
 
 ```bash
-# 1) (optional) create & activate a virtual env
+# (optional) venv
 python -m venv .venv
 # Linux/Mac
 source .venv/bin/activate
 # Windows
 # .venv\Scripts\activate
 
-# 2) install dependencies
-pip install streamlit streamlit-autorefresh matplotlib pandas numpy requests
+# install
+pip install -r requirements.txt
+# or:
+pip install streamlit pandas numpy requests matplotlib yfinance
 
-# 3) run
+# run
 streamlit run app.py
