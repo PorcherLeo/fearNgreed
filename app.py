@@ -84,7 +84,7 @@ except Exception as e:
     st.stop()
 
 # ---------- Onglets ----------
-tab_p1, tab_p2, tab_p3 = st.tabs(["Page1", "Page2", "Page3"])
+tab_p1, tab_p2, tab_p3, tab_p4 = st.tabs(["Page1", "Page2", "Page3", "Page4"])
 
 
 
@@ -587,7 +587,108 @@ with tab_p3:
                 def fmt(x): return "N/A" if not np.isfinite(x) else f"{x:+.2%}"
                 st.caption(f"7j: {fmt(w)} • 30j: {fmt(m)}")
 
+# -------------------- PAGE 4 : Corrélations entre actifs --------------------
+with tab_p4:
+    st.subheader("Corrélations entre actifs")
 
+    # --- Univers par défaut (modifiable) ---
+    DEFAULT_TICKERS = [
+        "SPY","QQQ","NVDA","AMD","MSFT","AAPL","AMZN","META","NFLX","GOOGL",
+        "EURUSD=X","ES=F","NQ=F","BTC-USD"
+    ]
+    # Alias d’affichage (optionnel)
+    NAMES = {
+        "SPY":"SPY","QQQ":"QQQ","NVDA":"NVDA","AMD":"AMD","MSFT":"MSFT","AAPL":"AAPL",
+        "AMZN":"AMZN","META":"META","NFLX":"NFLX","GOOGL":"GOOGL",
+        "EURUSD=X":"EURUSD","ES=F":"ES futures","NQ=F":"NQ futures","BTC-USD":"BTC-USD"
+    }
+
+    # --- Panneau de réglages ---
+    with st.expander("⚙️ Paramètres corrélation", expanded=True):
+        try:
+            import yfinance as yf
+            YF_OK = True
+        except Exception:
+            YF_OK = False
+            st.warning("`yfinance` n’est pas installé. Fais: `pip install yfinance`.")
+        tickers = st.multiselect("Actifs", DEFAULT_TICKERS, default=DEFAULT_TICKERS)
+        freq = st.selectbox("Fréquence", ["Journalière","Hebdomadaire","Mensuelle"], index=0)
+        win = st.selectbox("Fenêtre (observations)", [30,60,90,120,252,500], index=2)
+        ret_type = st.selectbox("Rendements", ["Simples (pct_change)","Log (ln)"], index=0)
+        sort_opt = st.checkbox("Trier par corrélation moyenne", value=True)
+
+    if YF_OK and len(tickers) >= 2:
+        @st.cache_data(ttl=900)
+        def fetch_closes(symbols):
+            # Période large pour couvrir toutes fenêtres/freq
+            df = yf.download(symbols, period="5y", interval="1d",
+                             auto_adjust=True, progress=False, threads=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                closes = df["Close"].copy()
+            else:
+                # cas 1 symbole → colonnes simples
+                closes = df[["Close"]].rename(columns={"Close": symbols[0]})
+            # Filtre colonnes (certains tickers peuvent manquer)
+            keep = [t for t in symbols if t in closes.columns]
+            return closes[keep]
+
+        def resample_to(closes: pd.DataFrame, freq: str) -> pd.DataFrame:
+            if freq == "Journalière":
+                return closes
+            if freq == "Hebdomadaire":
+                return closes.resample("W-FRI").last()
+            if freq == "Mensuelle":
+                return closes.resample("M").last()
+            return closes
+
+        def compute_returns(px: pd.DataFrame, ret_type: str) -> pd.DataFrame:
+            if ret_type.startswith("Log"):
+                return np.log(px).diff()
+            return px.pct_change()
+
+        # --- Pipeline ---
+        closes = fetch_closes(tickers)
+        if closes.empty:
+            st.warning("Pas de données téléchargées pour cet univers.")
+        else:
+            px = resample_to(closes, freq).dropna(how="all")
+            rets = compute_returns(px, ret_type).tail(win)
+
+            # Supprime les colonnes trop vides
+            good_cols = [c for c in rets.columns if rets[c].count() >= max(10, int(0.3*len(rets)))]
+            rets = rets[good_cols]
+            if len(rets.columns) < 2:
+                st.warning("Pas assez d’actifs avec données suffisantes.")
+            else:
+                corr = rets.corr()  # pairwise complete obs
+
+                # Tri optionnel par corrélation moyenne
+                if sort_opt:
+                    order = corr.mean().sort_values(ascending=False).index
+                    corr = corr.loc[order, order]
+
+                # --- Heatmap matplotlib (avec annotations) ---
+                labels = [NAMES.get(t, t) for t in corr.columns]
+                fig, ax = plt.subplots(figsize=(max(6, 0.6*len(labels)+2), max(5, 0.6*len(labels)+2)))
+                im = ax.imshow(corr.values, vmin=-1, vmax=1, cmap="RdYlGn")
+                ax.set_xticks(range(len(labels))); ax.set_yticks(range(len(labels)))
+                ax.set_xticklabels(labels, rotation=45, ha="right"); ax.set_yticklabels(labels)
+                # Annotations
+                for i in range(len(labels)):
+                    for j in range(len(labels)):
+                        val = corr.values[i,j]
+                        ax.text(j, i, f"{val:+.2f}", ha="center", va="center", fontsize=8, color="black")
+                cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                cbar.set_label("Corrélation de Pearson")
+                ax.set_title(f"Corrélations ({freq}, {ret_type.lower()}, n={len(rets)})")
+                st.pyplot(fig, use_container_width=True)
+
+                # Petit rappel
+                st.caption("Méthode: rendements " + ("logarithmiques" if ret_type.startswith("Log") else "simples")
+                           + f", fréquence {freq.lower()}, fenêtre de {len(rets)} observations. "
+                           "Corrélations calculées avec des observations disponibles (pairwise).")
+    else:
+        st.info("Sélectionne au moins deux actifs (et installe `yfinance` si nécessaire).")
 
 # ---------- Footer ----------
 st.divider()
