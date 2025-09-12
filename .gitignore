@@ -1,0 +1,21 @@
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Streamlit secrets (locaux)
+.streamlit/secrets.toml
